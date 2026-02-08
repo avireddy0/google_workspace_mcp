@@ -3,10 +3,11 @@ import os
 from typing import List, Optional
 from importlib import metadata
 
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Response
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.middleware import Middleware
+import httpx
 
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.google import GoogleProvider
@@ -38,20 +39,84 @@ _legacy_callback_registered = False
 session_middleware = Middleware(MCPSessionMiddleware)
 
 
-# Custom FastMCP that adds secure middleware stack for OAuth 2.1
+# Custom FastMCP that separates OAuth route mounting from /mcp auth enforcement.
+#
+# Problem: FastMCP's create_streamable_http_app() wraps the /mcp endpoint with
+# RequireAuthMiddleware when server.auth is set.  This blocks ALL unauthenticated
+# requests — including the MCP handshake (initialize, tools/list) that clients
+# like Open WebUI must perform BEFORE they can complete the OAuth 2.1 flow.
+#
+# Fix: Override http_app() to call create_streamable_http_app with auth=None
+# (so /mcp is NOT wrapped), while manually passing the OAuth routes and
+# BearerAuth middleware so the OAuth 2.1 flow still works.  Authentication is
+# enforced at the tool-call level by AuthInfoMiddleware.
 class SecureFastMCP(FastMCP):
-    def streamable_http_app(self) -> "Starlette":
-        """Override to add secure middleware stack for OAuth 2.1."""
-        app = super().streamable_http_app()
+    def http_app(self, path=None, middleware=None, json_response=None,
+                 stateless_http=None, transport="http", event_store=None,
+                 retry_interval=None):
+        """Override to allow unauthenticated MCP handshake while keeping OAuth 2.1.
 
-        # Add middleware in order (first added = outermost layer)
-        # Session Management - extracts session info for MCP context
-        app.user_middleware.insert(0, session_middleware)
+        When self.auth is set, the base class wraps /mcp with
+        RequireAuthMiddleware which returns 401 for any request without a
+        valid bearer token.  Clients that perform the MCP handshake before
+        completing OAuth (like Open WebUI) get "Failed to connect".
 
-        # Rebuild middleware stack
-        app.middleware_stack = app.build_middleware_stack()
-        logger.info("Added middleware stack: Session Management")
-        return app
+        This override:
+        1. Extracts OAuth routes (/.well-known, /authorize, /token, etc.)
+           and BearerAuth middleware from the auth provider
+        2. Calls create_streamable_http_app with auth=None so /mcp is open
+        3. Passes OAuth routes and middleware as extra parameters
+
+        Auth is still enforced at tool-call level by AuthInfoMiddleware.
+        """
+        from fastmcp.server.http import create_streamable_http_app
+
+        # For non-streamable transports, delegate to parent
+        if transport not in ("streamable-http", "http"):
+            return super().http_app(
+                path=path, middleware=middleware, json_response=json_response,
+                stateless_http=stateless_http, transport=transport,
+                event_store=event_store, retry_interval=retry_interval,
+            )
+
+        auth_provider = self.auth
+        mcp_path = path or self._deprecated_settings.streamable_http_path
+
+        # Collect OAuth routes and BearerAuth middleware from the auth provider
+        oauth_routes = []
+        combined_middleware = []
+        if auth_provider:
+            oauth_routes = auth_provider.get_routes(mcp_path=mcp_path)
+            combined_middleware = list(auth_provider.get_middleware())
+            logger.info(
+                "SecureFastMCP: Mounting %d OAuth routes + %d auth middleware "
+                "(RequireAuthMiddleware on /mcp DISABLED)",
+                len(oauth_routes), len(combined_middleware),
+            )
+        # Restore MCPSessionMiddleware (Starlette-layer session binding)
+        combined_middleware.insert(0, session_middleware)
+
+        if middleware:
+            combined_middleware.extend(middleware)
+
+        return create_streamable_http_app(
+            server=self,
+            streamable_http_path=mcp_path,
+            event_store=event_store,
+            retry_interval=retry_interval,
+            auth=None,  # KEY: don't wrap /mcp with RequireAuthMiddleware
+            json_response=(
+                json_response if json_response is not None
+                else self._deprecated_settings.json_response
+            ),
+            stateless_http=(
+                stateless_http if stateless_http is not None
+                else self._deprecated_settings.stateless_http
+            ),
+            debug=self._deprecated_settings.debug,
+            routes=oauth_routes,
+            middleware=combined_middleware,
+        )
 
 
 server = SecureFastMCP(
@@ -81,6 +146,29 @@ def _ensure_legacy_callback_route() -> None:
         return
     server.custom_route("/oauth2callback", methods=["GET"])(legacy_oauth2_callback)
     _legacy_callback_registered = True
+
+
+@server.custom_route("/register", methods=["POST"])
+async def oauth_register_alias(request: Request) -> Response:
+    """Alias /register to /oauth2/register for clients expecting DCR at root."""
+    port = os.getenv("PORT", os.getenv("WORKSPACE_MCP_PORT", "8000"))
+    target_url = f"http://127.0.0.1:{port}/oauth2/register"
+    body = await request.body()
+
+    headers = {
+        k: v
+        for k, v in request.headers.items()
+        if k.lower() not in {"host", "content-length"}
+    }
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(target_url, content=body, headers=headers)
+
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        media_type=resp.headers.get("content-type"),
+    )
 
 
 def configure_server_for_http():

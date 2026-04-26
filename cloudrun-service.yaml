@@ -1,0 +1,71 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: workspace-mcp
+  labels:
+    cloud.googleapis.com/location: us-central1
+  annotations:
+    run.googleapis.com/launch-stage: BETA
+spec:
+  template:
+    metadata:
+      annotations:
+        run.googleapis.com/execution-environment: gen2
+        autoscaling.knative.dev/minScale: "1"
+        autoscaling.knative.dev/maxScale: "2"
+        run.googleapis.com/cpu-throttling: "false"
+    spec:
+      containerConcurrency: 80
+      timeoutSeconds: 300
+      serviceAccountName: open-webui-sa@flow-os-1769675656.iam.gserviceaccount.com
+      containers:
+        - name: workspace-mcp
+          image: us-central1-docker.pkg.dev/flow-os-1769675656/flow-os/workspace-mcp:latest
+          ports:
+            - containerPort: 8080
+          resources:
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          env:
+            - name: TRANSPORT
+              value: "streamable-http"
+            - name: TOOLS
+              value: "gmail calendar drive"
+            - name: WORKSPACE_MCP_CREDENTIALS_DIR
+              value: "/app/store_creds"
+            - name: MCP_SINGLE_USER_MODE
+              value: "1"
+            - name: WORKSPACE_EXTERNAL_URL
+              value: "https://workspace-mcp-210087613384.us-central1.run.app"
+            - name: GOOGLE_OAUTH_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  key: latest
+                  name: google-oauth-client-id
+            - name: GOOGLE_OAUTH_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  key: latest
+                  name: google-oauth-client-secret
+          volumeMounts:
+            - name: creds-volume
+              mountPath: /app/store_creds
+          startupProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 20
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            periodSeconds: 30
+      volumes:
+        - name: creds-volume
+          csi:
+            driver: gcsfuse.run.googleapis.com
+            volumeAttributes:
+              bucketName: workspace-mcp-creds-flow-os
